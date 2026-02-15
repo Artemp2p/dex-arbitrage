@@ -1,0 +1,4 @@
+ccxt
+streamlit
+requests
+pandas
