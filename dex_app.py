@@ -3,160 +3,119 @@ import ccxt
 import requests
 import pandas as pd
 import time
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
-# --- КОНФИГУРАЦИЯ СЕТЕЙ (Chain IDs для GoPlus) ---
+# --- КОНФИГУРАЦИЯ СЕТЕЙ ---
 SUPPORTED_CHAINS = {
-    'solana': {'name': 'Solana (SOL)', 'id': 'solana'},
-    'eth': {'name': 'Ethereum (ETH)', 'id': '1'},
-    'bsc': {'name': 'BSC (BNB)', 'id': '56'},
-    'arbitrum': {'name': 'Arbitrum (ARB)', 'id': '42161'},
-    'polygon': {'name': 'Polygon (MATIC)', 'id': '137'},
-    'avalanche': {'name': 'Avalanche (AVAX)', 'id': '43114'},
-    'optimism': {'name': 'Optimism (OP)', 'id': '10'},
-    'base': {'name': 'Base', 'id': '8453'},
-    'aptos': {'name': 'Aptos (APT)', 'id': 'aptos'},
-    'sui': {'name': 'Sui (SUI)', 'id': 'sui'}
+    'solana': {'name': 'Solana', 'go_id': 'solana'},
+    'bsc': {'name': 'BSC', 'go_id': '56'},
+    'ethereum': {'name': 'Ethereum', 'go_id': '1'},
+    'arbitrum': {'name': 'Arbitrum', 'go_id': '42161'},
+    'base': {'name': 'Base', 'go_id': '8453'},
+    'optimism': {'name': 'Optimism', 'go_id': '10'},
+    'polygon': {'name': 'Polygon', 'go_id': '137'},
+    'aptos': {'name': 'Aptos', 'go_id': 'aptos'},
+    'sui': {'name': 'Sui', 'go_id': 'sui'}
 }
 
 CEX_LIST = ['bybit', 'mexc', 'lbank2']
 
-st.set_page_config(page_title="CEX-DEX Arb 2026", layout="wide")
+st.set_page_config(page_title="DEX-CEX Arb Pro 2026", layout="wide")
 
 # Темная тема
 st.markdown("""
     <style>
-    .stApp { background-color: #0b0e14; color: #e1e1e1; }
-    .stDataFrame { border: 1px solid #1f2937; }
+    .stApp { background-color: #0e1117; color: white; }
+    .stDataFrame { border: 1px solid #30363d; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- ЛОГИКА ПРОВЕРКИ ---
+# --- ФУНКЦИИ ---
 
-def check_security(chain_id, address):
-    """Проверка HoneyPot и налогов через GoPlus"""
-    if chain_id in ['solana', 'aptos', 'sui']:
-        return "Manual Check Required"
+def check_hp(address, chain_id):
+    if chain_id in ['solana', 'aptos', 'sui']: return "Manual"
     try:
         url = f"https://api.goplussecurity.io/api/v1/token_security/{chain_id}?contract_addresses={address}"
         res = requests.get(url, timeout=5).json()
-        data = res.get('result', {}).get(address.lower(), {})
-        if not data: return "No Security Data"
-        
-        if data.get('is_honeypot') == '1': return "❌ HONEYPOT"
-        
+        data = res['result'][address.lower()]
+        if data.get('is_honeypot') == '1': return "❌ SCAM"
         b_tax = float(data.get('buy_tax', 0)) * 100
         s_tax = float(data.get('sell_tax', 0)) * 100
-        return f"✅ Buy: {b_tax:.1f}% | Sell: {s_tax:.1f}%"
-    except:
-        return "Check Error"
+        return f"✅ B:{b_tax:.0f}% S:{s_tax:.0f}%"
+    except: return "N/A"
 
-def get_dex_pairs(chain_name):
-    """Загрузка данных с DexScreener"""
+def get_cex_prices(ex_id, symbols):
     try:
-        url = f"https://api.dexscreener.com/latest/dex/search?q={chain_name}"
-        res = requests.get(url, timeout=10).json()
-        return [p for p in res.get('pairs', []) if p.get('quoteToken', {}).get('symbol') in ['USDT', 'USDC']]
-    except:
-        return []
-
-def get_cex_ticker(ex_id, symbols, proxy=None):
-    """Стабильное получение цен с CEX"""
-    try:
-        # Инициализация биржи с принудительным Spot режимом
-        ex = getattr(ccxt, ex_id)({
-            'enableRateLimit': True,
-            'timeout': 20000,
-            'options': {'defaultType': 'spot'}
-        })
-        if proxy:
-            ex.proxies = {'http': proxy, 'https': proxy}
-        
-        # Важно: загружаем рынки перед поиском
+        ex = getattr(ccxt, ex_id)({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
         ex.load_markets()
         tickers = ex.fetch_tickers()
-        
-        found_data = {}
-        for s in symbols:
-            pair = f"{s}/USDT"
-            if pair in tickers:
-                t = tickers[pair]
-                if t['bid'] and t['ask']:
-                    found_data[s] = {'bid': t['bid'], 'ask': t['ask']}
-        return ex_id, found_data
-    except Exception as e:
-        return ex_id, {}
+        return ex_id, {s: tickers[f"{s}/USDT"]['bid'] for s in symbols if f"{s}/USDT" in tickers and tickers[f"{s}/USDT"]['bid']}
+    except: return ex_id, {}
 
 # --- ИНТЕРФЕЙС ---
-st.title("🔗 CEX-DEX Arb Scanner Pro")
+st.title("🛰 DEX-to-CEX Arbitrage Terminal")
 
 with st.sidebar:
     st.header("Настройки")
-    chain_key = st.selectbox("Блокчейн:", list(SUPPORTED_CHAINS.keys()), 
+    chain_key = st.selectbox("Блокчейн для скана:", list(SUPPORTED_CHAINS.keys()), 
                              format_func=lambda x: SUPPORTED_CHAINS[x]['name'])
-    proxy_url = st.text_input("Прокси (обязательно для облака):", placeholder="http://user:pass@ip:port")
-    min_spread = st.slider("Мин. профит (%)", 1.0, 10.0, 2.0)
-    min_liq = st.number_input("Мин. ликвидность ($)", value=5000)
-    
+    min_spread = st.slider("Мин. спред (%)", 0.5, 15.0, 2.0)
+    min_liq = st.number_input("Мин. ликвидность ($)", value=10000)
     st.divider()
-    auto_refresh = st.checkbox("🔄 Авто-обновление (5 мин)")
+    st.info("Бот ищет монеты на DEX и проверяет их цену на Bybit, MEXC, LBank.")
 
-# --- ОСНОВНОЙ ЦИКЛ ---
-def run_scanner():
-    st.write(f"🕒 Обновлено: {datetime.now().strftime('%H:%M:%S')}")
-    
-    # 1. Данные с DEX
-    dex_raw = get_dex_pairs(chain_key)
-    dex_clean = [p for p in dex_raw if p.get('liquidity', {}).get('usd', 0) >= min_liq]
-    
-    if not dex_clean:
-        st.warning("Монеты не найдены. Попробуйте сменить сеть или уменьшить порог ликвидности.")
-        return
+# --- ЛОГИКА ---
+if st.button("🚀 ЗАПУСТИТЬ ПОИСК СВЯЗОК", use_container_width=True):
+    # 1. Скан DexScreener
+    try:
+        res = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={chain_key}", timeout=10).json()
+        pairs = [p for p in res.get('pairs', []) if p.get('liquidity', {}).get('usd', 0) >= min_liq]
+    except:
+        st.error("Ошибка подключения к DexScreener")
+        pairs = []
 
-    symbols = list(set([p['baseToken']['symbol'].upper() for p in dex_clean]))
-
-    # 2. Данные с CEX
-    with st.spinner(f'Сверяем {len(symbols)} монет с биржами...'):
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            cex_results = dict(list(executor.map(lambda x: get_cex_ticker(x, symbols, proxy_url), CEX_LIST)))
-
-    # 3. Сравнение
-    table_data = []
-    for d in dex_clean:
-        s = d['baseToken']['symbol'].upper()
-        d_price = float(d['priceUsd'])
+    if pairs:
+        symbols = list(set([p['baseToken']['symbol'].upper() for p in pairs]))
         
-        for cex_id, data in cex_results.items():
-            if s in data:
-                cex = data[s]
-                # Считаем спред (Купить на DEX - Продать на CEX)
-                spread = ((cex['bid'] - d_price) / d_price) * 100
-                
-                if min_spread < spread < 50:
-                    security = check_security(SUPPORTED_CHAINS[chain_key]['id'], d['baseToken']['address'])
-                    if "❌" in security: continue
+        # 2. Скан CEX
+        with st.spinner(f'Сверяем {len(symbols)} токенов с биржами...'):
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                cex_results = dict(list(executor.map(lambda x: get_cex_prices(x, symbols), CEX_LIST)))
+
+        # 3. Формирование таблицы
+        results = []
+        for p in pairs:
+            sym = p['baseToken']['symbol'].upper()
+            d_price = float(p['priceUsd'])
+            addr = p['baseToken']['address']
+            
+            for ex_id, prices in cex_results.items():
+                if sym in prices:
+                    c_price = prices[sym]
+                    spread = ((c_price - d_price) / d_price) * 100
                     
-                    table_data.append({
-                        'Монета': s,
-                        'ПРОФИТ': f"{spread:.2f}%",
-                        'КУПИТЬ': f"DEX ({d['dexId']})",
-                        'ПРОДАТЬ': cex_id.upper(),
-                        'БЕЗОПАСНОСТЬ': security,
-                        'DEX Цена': f"{d_price:.6f}",
-                        'CEX Цена': f"{cex['bid']:.6f}",
-                        'Контракт': d['baseToken']['address']
-                    })
+                    if min_spread < spread < 40:
+                        results.append({
+                            'Монета': sym,
+                            'Спред (%)': f"{spread:.2f}%",
+                            'Блокчейн': SUPPORTED_CHAINS[chain_key]['name'],
+                            'DEX Цена': f"{d_price:.6f}",
+                            f'CEX {ex_id.upper()}': f"{c_price:.6f}",
+                            'Безопасность': check_hp(addr, SUPPORTED_CHAINS[chain_key]['go_id']),
+                            'График': f"https://dexscreener.com/{chain_key}/{addr}",
+                            'Контракт': addr
+                        })
 
-    if table_data:
-        st.dataframe(pd.DataFrame(table_data).sort_values('ПРОФИТ', ascending=False), use_container_width=True, hide_index=True)
-    else:
-        st.info("Активных связок не найдено. Проверьте настройки прокси.")
-
-if auto_refresh:
-    run_scanner()
-    time.sleep(300)
-    st.rerun()
-else:
-    if st.button("🚀 ЗАПУСТИТЬ СКАНЕР", use_container_width=True):
-        run_scanner()
+        if results:
+            df = pd.DataFrame(results).sort_values('Спред (%)', ascending=False)
+            # Отображаем ссылку как кликабельный объект
+            st.dataframe(
+                df, 
+                use_container_width=True, 
+                column_config={
+                    "График": st.column_config.LinkColumn("График", display_text="Open Chart")
+                },
+                hide_index=True
+            )
+        else:
+            st.warning("Связок не найдено. Попробуйте сменить сеть.")
