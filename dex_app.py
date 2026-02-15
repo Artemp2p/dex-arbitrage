@@ -5,117 +5,109 @@ import pandas as pd
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-# --- КОНФИГУРАЦИЯ СЕТЕЙ ---
+# --- КОНФИГУРАЦИЯ ---
 SUPPORTED_CHAINS = {
     'solana': {'name': 'Solana', 'go_id': 'solana'},
     'bsc': {'name': 'BSC', 'go_id': '56'},
     'ethereum': {'name': 'Ethereum', 'go_id': '1'},
     'arbitrum': {'name': 'Arbitrum', 'go_id': '42161'},
     'base': {'name': 'Base', 'go_id': '8453'},
-    'optimism': {'name': 'Optimism', 'go_id': '10'},
     'polygon': {'name': 'Polygon', 'go_id': '137'},
-    'aptos': {'name': 'Aptos', 'go_id': 'aptos'},
-    'sui': {'name': 'Sui', 'go_id': 'sui'}
+    'aptos': {'name': 'Aptos', 'go_id': 'aptos'}
 }
 
 CEX_LIST = ['bybit', 'mexc', 'lbank2']
 
-st.set_page_config(page_title="DEX-CEX Arb Pro 2026", layout="wide")
+st.set_page_config(page_title="Arbitrage Scanner 2026", layout="wide")
 
-# Темная тема
-st.markdown("""
-    <style>
-    .stApp { background-color: #0e1117; color: white; }
-    .stDataFrame { border: 1px solid #30363d; }
-    </style>
-    """, unsafe_allow_html=True)
+# --- ЛОГИКА ---
 
-# --- ФУНКЦИИ ---
+@st.cache_data(ttl=300) # Кэшируем рынки на 5 минут для скорости
+def get_all_cex_markets():
+    markets = {}
+    for ex_id in CEX_LIST:
+        try:
+            ex = getattr(ccxt, ex_id)({'enableRateLimit': True})
+            m = ex.load_markets()
+            # Берем только USDT пары
+            markets[ex_id] = {s.split('/')[0]: s for s in m if '/USDT' in s}
+        except: continue
+    return markets
 
 def check_hp(address, chain_id):
-    if chain_id in ['solana', 'aptos', 'sui']: return "Manual"
+    if chain_id in ['solana', 'aptos']: return "Manual"
     try:
         url = f"https://api.goplussecurity.io/api/v1/token_security/{chain_id}?contract_addresses={address}"
         res = requests.get(url, timeout=5).json()
         data = res['result'][address.lower()]
         if data.get('is_honeypot') == '1': return "❌ SCAM"
-        b_tax = float(data.get('buy_tax', 0)) * 100
-        s_tax = float(data.get('sell_tax', 0)) * 100
-        return f"✅ B:{b_tax:.0f}% S:{s_tax:.0f}%"
+        return f"✅ B:{float(data.get('buy_tax', 0))*100:.0f}% S:{float(data.get('sell_tax', 0))*100:.0f}%"
     except: return "N/A"
 
-def get_cex_prices(ex_id, symbols):
-    try:
-        ex = getattr(ccxt, ex_id)({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
-        ex.load_markets()
-        tickers = ex.fetch_tickers()
-        return ex_id, {s: tickers[f"{s}/USDT"]['bid'] for s in symbols if f"{s}/USDT" in tickers and tickers[f"{s}/USDT"]['bid']}
-    except: return ex_id, {}
-
 # --- ИНТЕРФЕЙС ---
-st.title("🛰 DEX-to-CEX Arbitrage Terminal")
+st.title("🛰 Global CEX-DEX Scanner")
 
 with st.sidebar:
     st.header("Настройки")
-    chain_key = st.selectbox("Блокчейн для скана:", list(SUPPORTED_CHAINS.keys()), 
-                             format_func=lambda x: SUPPORTED_CHAINS[x]['name'])
-    min_spread = st.slider("Мин. спред (%)", 0.5, 15.0, 2.0)
-    min_liq = st.number_input("Мин. ликвидность ($)", value=10000)
-    st.divider()
-    st.info("Бот ищет монеты на DEX и проверяет их цену на Bybit, MEXC, LBank.")
+    chain_key = st.selectbox("Сеть:", list(SUPPORTED_CHAINS.keys()))
+    min_spread = st.number_input("Мин. спред (%)", value=1.0, step=0.1)
+    min_liq = st.number_input("Мин. ликвидность ($)", value=5000)
+    max_pairs = st.slider("Глубина поиска на DEX (пар)", 50, 500, 200)
 
-# --- ЛОГИКА ---
-if st.button("🚀 ЗАПУСТИТЬ ПОИСК СВЯЗОК", use_container_width=True):
-    # 1. Скан DexScreener
-    try:
-        res = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={chain_key}", timeout=10).json()
-        pairs = [p for p in res.get('pairs', []) if p.get('liquidity', {}).get('usd', 0) >= min_liq]
-    except:
-        st.error("Ошибка подключения к DexScreener")
-        pairs = []
+if st.button("🚀 НАЧАТЬ ПОЛНОЕ СКАНИРОВАНИЕ", use_container_width=True):
+    # 1. Загружаем рынки бирж (один раз)
+    all_cex = get_all_cex_markets()
+    
+    # 2. Получаем пары с DEX
+    with st.spinner('Загружаем пары с DexScreener...'):
+        try:
+            res = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={chain_key}", timeout=10).json()
+            pairs = [p for p in res.get('pairs', []) if p.get('liquidity', {}).get('usd', 0) >= min_liq][:max_pairs]
+        except:
+            st.error("Ошибка API"); pairs = []
 
-    if pairs:
-        symbols = list(set([p['baseToken']['symbol'].upper() for p in pairs]))
-        
-        # 2. Скан CEX
-        with st.spinner(f'Сверяем {len(symbols)} токенов с биржами...'):
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                cex_results = dict(list(executor.map(lambda x: get_cex_prices(x, symbols), CEX_LIST)))
-
-        # 3. Формирование таблицы
+    if not pairs:
+        st.warning("Пар не найдено.")
+    else:
         results = []
-        for p in pairs:
-            sym = p['baseToken']['symbol'].upper()
-            d_price = float(p['priceUsd'])
-            addr = p['baseToken']['address']
-            
-            for ex_id, prices in cex_results.items():
-                if sym in prices:
-                    c_price = prices[sym]
-                    spread = ((c_price - d_price) / d_price) * 100
-                    
-                    if min_spread < spread < 40:
-                        results.append({
-                            'Монета': sym,
-                            'Спред (%)': f"{spread:.2f}%",
-                            'Блокчейн': SUPPORTED_CHAINS[chain_key]['name'],
-                            'DEX Цена': f"{d_price:.6f}",
-                            f'CEX {ex_id.upper()}': f"{c_price:.6f}",
-                            'Безопасность': check_hp(addr, SUPPORTED_CHAINS[chain_key]['go_id']),
-                            'График': f"https://dexscreener.com/{chain_key}/{addr}",
-                            'Контракт': addr
-                        })
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
+        # 3. Процесс сравнения
+        for i, p in enumerate(pairs):
+            sym = p['baseToken']['symbol'].upper()
+            status_text.text(f"Проверка {i+1}/{len(pairs)}: {sym}")
+            progress_bar.progress((i + 1) / len(pairs))
+            
+            d_price = float(p['priceUsd'])
+            
+            # Ищем этот символ на всех наших биржах
+            for ex_id, markets in all_cex.items():
+                if sym in markets:
+                    try:
+                        ex = getattr(ccxt, ex_id)()
+                        ticker = ex.fetch_ticker(markets[sym])
+                        c_price = ticker['bid']
+                        
+                        if c_price:
+                            spread = ((c_price - d_price) / d_price) * 100
+                            if min_spread < spread < 50:
+                                results.append({
+                                    'Токен': sym,
+                                    'Спред': f"{spread:.2f}%",
+                                    'Биржа': ex_id.upper(),
+                                    'DEX Цена': f"{d_price:.6f}",
+                                    'CEX Цена': f"{c_price:.6f}",
+                                    'Безопасность': check_hp(p['baseToken']['address'], SUPPORTED_CHAINS[chain_key]['go_id']),
+                                    'График': f"https://dexscreener.com/{chain_key}/{p['baseToken']['address']}"
+                                })
+                    except: continue
+
+        status_text.text("Сканирование завершено!")
         if results:
-            df = pd.DataFrame(results).sort_values('Спред (%)', ascending=False)
-            # Отображаем ссылку как кликабельный объект
-            st.dataframe(
-                df, 
-                use_container_width=True, 
-                column_config={
-                    "График": st.column_config.LinkColumn("График", display_text="Open Chart")
-                },
-                hide_index=True
-            )
+            df = pd.DataFrame(results).sort_values('Спред', ascending=False)
+            st.dataframe(df, use_container_width=True, column_config={
+                "График": st.column_config.LinkColumn("График", display_text="Открыть")
+            }, hide_index=True)
         else:
-            st.warning("Связок не найдено. Попробуйте сменить сеть.")
+            st.info("Совпадений не найдено. Попробуйте увеличить глубину поиска или сменить сеть.")
