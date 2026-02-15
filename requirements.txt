@@ -1,4 +1,4 @@
-ccxt
+ccxt==4.2.1
 streamlit
-requests
 pandas
+requests
